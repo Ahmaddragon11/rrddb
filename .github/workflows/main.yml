@@ -1,0 +1,215 @@
+name: AHMAD DRAGON - Windows 2025 RDP
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  secure-rdp:
+    runs-on: windows-2025
+    timeout-minutes: 350
+
+    steps:
+      # 1. Validate secrets
+      - name: Validate Configuration
+        shell: pwsh
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+        run: |
+          if (!$env:RDP_PASSWORD) {
+            throw "Missing RDP_PASSWORD secret"
+          }
+
+          if (!$env:TAILSCALE_AUTHKEY) {
+            throw "Missing TAILSCALE_AUTHKEY secret"
+          }
+
+          if ($env:RDP_PASSWORD.Length -lt 12) {
+            throw "Password must contain at least 12 characters"
+          }
+
+      # 2. System information
+      - name: System Information
+        shell: pwsh
+        run: |
+          $os = Get-CimInstance Win32_OperatingSystem
+          $cpu = Get-CimInstance Win32_Processor
+          $disk = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='C:'"
+
+          Write-Host "================================"
+          Write-Host " AHMAD DRAGON WINDOWS SERVER"
+          Write-Host "================================"
+
+          Write-Host "OS: $($os.Caption)"
+          Write-Host "Build: $($os.BuildNumber)"
+          Write-Host "RAM: $([math]::Round($os.TotalVisibleMemorySize / 1MB,2)) GB"
+          Write-Host "CPU: $($cpu.Name)"
+          Write-Host "Cores: $($cpu.NumberOfLogicalProcessors)"
+          Write-Host "Disk Free: $([math]::Round($disk.FreeSpace / 1GB,2)) GB"
+
+      # 3. Enable secure Remote Desktop
+      - name: Configure Remote Desktop
+        shell: pwsh
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name 'fDenyTSConnections' -Value 0
+
+          # Keep Network Level Authentication enabled
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name 'UserAuthentication' -Value 1
+
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name 'SecurityLayer' -Value 2
+
+          $password = ConvertTo-SecureString `
+            $env:RDP_PASSWORD -AsPlainText -Force
+
+          if (Get-LocalUser -Name 'RDP' -ErrorAction SilentlyContinue) {
+            Set-LocalUser -Name 'RDP' -Password $password
+            Enable-LocalUser -Name 'RDP'
+          }
+          else {
+            New-LocalUser `
+              -Name 'RDP' `
+              -Password $password `
+              -Description 'AHMAD DRAGON Remote User' `
+              -AccountNeverExpires
+          }
+
+          $member = Get-LocalGroupMember Administrators |
+            Where-Object { $_.Name -match '\\RDP$' }
+
+          if (!$member) {
+            Add-LocalGroupMember `
+              -Group Administrators `
+              -Member RDP
+          }
+
+          # Remove previous rule
+          Get-NetFirewallRule `
+            -DisplayName 'AHMAD DRAGON RDP' `
+            -ErrorAction SilentlyContinue |
+            Remove-NetFirewallRule
+
+          # Allow RDP only through Tailscale
+          New-NetFirewallRule `
+            -DisplayName 'AHMAD DRAGON RDP' `
+            -Direction Inbound `
+            -Protocol TCP `
+            -LocalPort 3389 `
+            -RemoteAddress '100.64.0.0/10' `
+            -Action Allow `
+            -Profile Any
+
+          Set-Service TermService -StartupType Automatic
+          Start-Service TermService
+
+      # 4. Install Tailscale
+      - name: Install Tailscale
+        shell: pwsh
+        run: |
+          $installer = "$env:TEMP\tailscale.msi"
+
+          Invoke-WebRequest `
+            'https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi' `
+            -OutFile $installer
+
+          $process = Start-Process msiexec.exe `
+            -ArgumentList "/i `"$installer`" /qn /norestart" `
+            -Wait -PassThru
+
+          Remove-Item $installer -Force
+
+          if ($process.ExitCode -notin @(0,3010)) {
+            throw "Tailscale installation failed"
+          }
+
+      # 5. Connect Tailscale
+      - name: Connect Tailscale
+        shell: pwsh
+        env:
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+        run: |
+          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+
+          & $ts up `
+            "--authkey=$env:TAILSCALE_AUTHKEY" `
+            "--hostname=ahmad-dragon-$env:GITHUB_RUN_ID"
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Tailscale connection failed"
+          }
+
+          $ip = $null
+
+          for ($i = 0; $i -lt 30; $i++) {
+            Start-Sleep 2
+            $result = & $ts ip -4
+
+            if ($result -match '^100\.') {
+              $ip = $result.Trim()
+              break
+            }
+          }
+
+          if (!$ip) {
+            throw "Tailscale IP not found"
+          }
+
+          "TAILSCALE_IP=$ip" >> $env:GITHUB_ENV
+
+      # 6. Verify RDP
+      - name: Verify RDP
+        shell: pwsh
+        run: |
+          $ready = $false
+
+          for ($i = 0; $i -lt 30; $i++) {
+            $listener = Get-NetTCPConnection `
+              -LocalPort 3389 `
+              -State Listen `
+              -ErrorAction SilentlyContinue
+
+            if ($listener) {
+              $ready = $true
+              break
+            }
+
+            Start-Sleep 2
+          }
+
+          if (!$ready) {
+            throw "RDP is not listening"
+          }
+
+          Write-Host "RDP is ready!"
+
+      # 7. Connection details
+      - name: RDP Connection Information
+        shell: pwsh
+        run: |
+          Write-Host ""
+          Write-Host "======================================"
+          Write-Host "       AHMAD DRAGON RDP SERVER"
+          Write-Host "======================================"
+          Write-Host "Operating System: Windows Server 2025"
+          Write-Host "IP Address: $env:TAILSCALE_IP"
+          Write-Host "Username: RDP"
+          Write-Host "Password: GitHub Secret RDP_PASSWORD"
+          Write-Host "Port: 3389"
+          Write-Host "Network: Tailscale"
+          Write-Host "======================================"
+
+          # Keep server running
+          while ($true) {
+            Write-Host "RDP ACTIVE: $(Get-Date)"
+            Start-Sleep -Seconds 300
+          }
