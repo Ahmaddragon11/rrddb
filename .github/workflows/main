@@ -1,0 +1,838 @@
+name: AHMAD DRAGON - Multi-OS RDP & Web Control Center
+
+on:
+  workflow_dispatch:
+    inputs:
+      os_version:
+        description: 'Select Operating System & Version (اختر النظام والإصدار)'
+        required: true
+        default: 'windows-2025'
+        type: choice
+        options:
+          - windows-2025
+          - windows-2022
+          - windows-2019
+          - ubuntu-24.04
+          - ubuntu-22.04
+          - macos-15
+      password_mode:
+        description: 'Password Mode (طريقة إنشاء أو اختيار كلمة المرور داخلياً)'
+        required: true
+        default: 'custom_input'
+        type: choice
+        options:
+          - auto_generate
+          - custom_input
+          - github_secret
+      custom_password:
+        description: 'Custom Password (اكتب كلمة المرور هنا إذا اخترت custom_input - 12 حرف فأكثر)'
+        required: false
+        default: ''
+        type: string
+      rdp_username:
+        description: 'Administrator Username (اسم مستخدم السيرفر)'
+        required: true
+        default: 'RDP'
+        type: string
+      session_minutes:
+        description: 'Active Duration in Minutes (مدة بقاء السيرفر شغال بالدقائق)'
+        required: true
+        default: '350'
+        type: choice
+        options:
+          - '350'
+          - '300'
+          - '240'
+          - '180'
+          - '120'
+          - '60'
+      enable_web_panel:
+        description: 'Launch AHMAD DRAGON Web Control Panel on Port 8080 (تشغيل موقع التحكم السريع)'
+        required: false
+        default: true
+        type: boolean
+      enable_audio_boost:
+        description: 'Enable Audio, Dark Mode & Performance Boost (تفعيل الصوت والوضع الليلي)'
+        required: false
+        default: true
+        type: boolean
+      install_tools:
+        description: 'Install Essential Tools & Desktop Shortcuts (تثبيت الأدوات الأساسية)'
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  ahmad-dragon-rdp:
+    name: AHMAD DRAGON // ${{ inputs.os_version || 'windows-2025' }}
+    runs-on: ${{ inputs.os_version || 'windows-2025' }}
+    timeout-minutes: 360
+
+    steps:
+      # =========================================================================
+      # 1. VALIDATE CONFIGURATION & INTERNAL PASSWORD GENERATOR ENGINE
+      # =========================================================================
+      - name: 1. Initialize & Internal Password Manager
+        shell: pwsh
+        env:
+          SECRET_RDP_PASS: ${{ secrets.RDP_PASSWORD }}
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+          INPUT_PASS_MODE: ${{ inputs.password_mode }}
+          INPUT_CUSTOM_PASS: ${{ inputs.custom_password }}
+          INPUT_USER: ${{ inputs.rdp_username }}
+          INPUT_OS: ${{ inputs.os_version }}
+        run: |
+          Write-Host "========================================================" -ForegroundColor Cyan
+          Write-Host "   AHMAD DRAGON // MULTI-OS RDP & WEB COMMAND ENGINE    " -ForegroundColor Cyan
+          Write-Host "========================================================" -ForegroundColor Cyan
+
+          if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTHKEY)) {
+            throw "Missing TAILSCALE_AUTHKEY secret! Please add TAILSCALE_AUTHKEY in Repository Settings -> Secrets."
+          }
+
+          $rawUser = if ([string]::IsNullOrWhiteSpace($env:INPUT_USER)) { "RDP" } else { $env:INPUT_USER.Trim() }
+          # Sanitize username to safe alphanumeric/underscore/hyphen characters
+          $username = ($rawUser -replace '[^a-zA-Z0-9_-]', '')
+          if ([string]::IsNullOrWhiteSpace($username)) { $username = "RDP" }
+          if ($IsLinux -or $IsMacOS) {
+            # Linux/macOS usernames work best in lowercase without conflicts with runner user
+            $username = $username.ToLower()
+            if ($username -eq "runner" -or $username -eq "root") { $username = "dragon_rdp" }
+          }
+
+          $mode = if ([string]::IsNullOrWhiteSpace($env:INPUT_PASS_MODE)) { "custom_input" } else { $env:INPUT_PASS_MODE }
+          $finalPass = ""
+          $passSource = ""
+
+          function New-DragonPassword {
+            $upper   = "ABCDEFGHJKLMNPQRSTUVWXYZ".ToCharArray()
+            $lower   = "abcdefghijkmnopqrstuvwxyz".ToCharArray()
+            $digits  = "23456789".ToCharArray()
+            $symbols = "!@#%^*_-+=".ToCharArray()
+            $chars = @(
+              ($upper   | Get-Random -Count 3) +
+              ($lower   | Get-Random -Count 5) +
+              ($digits  | Get-Random -Count 4) +
+              ($symbols | Get-Random -Count 3)
+            )
+            $shuffled = ($chars | Sort-Object { Get-Random }) -join ''
+            return "Drg#" + $shuffled
+          }
+
+          if ($mode -eq "custom_input") {
+            if ([string]::IsNullOrWhiteSpace($env:INPUT_CUSTOM_PASS)) {
+              Write-Warning "custom_input selected but field was empty. Auto-generating secure password instead..."
+              $finalPass = New-DragonPassword
+              $passSource = "Auto-Generated (Fallback)"
+            } elseif ($env:INPUT_CUSTOM_PASS.Length -lt 12) {
+              throw "Custom password must contain at least 12 characters."
+            } else {
+              $finalPass = $env:INPUT_CUSTOM_PASS
+              $passSource = "Custom Workflow Input"
+              Write-Host "::add-mask::$finalPass"
+            }
+          } elseif ($mode -eq "github_secret") {
+            if ([string]::IsNullOrWhiteSpace($env:SECRET_RDP_PASS)) {
+              Write-Warning "RDP_PASSWORD secret not found. Auto-generating internal password so workflow succeeds..."
+              $finalPass = New-DragonPassword
+              $passSource = "Auto-Generated (Secret Fallback)"
+            } elseif ($env:SECRET_RDP_PASS.Length -lt 12) {
+              throw "RDP_PASSWORD secret must contain at least 12 characters."
+            } else {
+              $finalPass = $env:SECRET_RDP_PASS
+              $passSource = "GitHub Secret (RDP_PASSWORD)"
+              Write-Host "::add-mask::$finalPass"
+            }
+          } else {
+            $finalPass = New-DragonPassword
+            $passSource = "Internal Auto-Generator"
+          }
+
+          $remotePort = if ($IsMacOS) { "5900" } else { "3389" }
+          $remoteProto = if ($IsMacOS) { "VNC" } else { "RDP" }
+
+          "DRAGON_USER=$username" >> $env:GITHUB_ENV
+          "DRAGON_PASS=$finalPass" >> $env:GITHUB_ENV
+          "DRAGON_PASS_SOURCE=$passSource" >> $env:GITHUB_ENV
+          "DRAGON_RDP_PORT=$remotePort" >> $env:GITHUB_ENV
+          "DRAGON_PROTO=$remoteProto" >> $env:GITHUB_ENV
+          "DRAGON_WEB_PORT=8080" >> $env:GITHUB_ENV
+          "DRAGON_OS_LABEL=$($env:INPUT_OS)" >> $env:GITHUB_ENV
+          "DRAGON_START_UTC=$((Get-Date).ToUniversalTime().ToString('o'))" >> $env:GITHUB_ENV
+
+          Write-Host "[OK] Target Username : $username" -ForegroundColor Green
+          Write-Host "[OK] Password Source : $passSource" -ForegroundColor Green
+          Write-Host "[OK] Remote Protocol : $remoteProto (Port $remotePort)" -ForegroundColor Green
+
+      # =========================================================================
+      # 2. DEEP SYSTEM HARDWARE, STORAGE & NETWORK DIAGNOSTICS
+      # =========================================================================
+      - name: 2. Deep System & Hardware Telemetry
+        shell: pwsh
+        env:
+          INPUT_OS: ${{ inputs.os_version || 'windows-2025' }}
+        run: |
+          $telemetry = [ordered]@{
+            RunnerOS      = $env:RUNNER_OS
+            RunnerArch    = $env:RUNNER_ARCH
+            SelectedImage = $env:INPUT_OS
+            Hostname      = [System.Net.Dns]::GetHostName()
+            Timestamp     = (Get-Date).ToUniversalTime().ToString("yyyy-MM-dd HH:mm:ss UTC")
+          }
+
+          if ($IsWindows) {
+            $os = Get-CimInstance Win32_OperatingSystem
+            $cpu = Get-CimInstance Win32_Processor | Select-Object -First 1
+            $disk = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='C:'"
+            $telemetry.OSCaption   = $os.Caption.Trim()
+            $telemetry.OSBuild     = $os.BuildNumber
+            $telemetry.CPUName     = $cpu.Name.Trim()
+            $telemetry.CPUCores    = $cpu.NumberOfLogicalProcessors
+            $telemetry.RAMTotalGB  = [math]::Round($os.TotalVisibleMemorySize / 1MB, 2)
+            $telemetry.RAMFreeGB   = [math]::Round($os.FreePhysicalMemory / 1MB, 2)
+            $telemetry.DiskTotalGB = [math]::Round($disk.Size / 1GB, 2)
+            $telemetry.DiskFreeGB  = [math]::Round($disk.FreeSpace / 1GB, 2)
+          } elseif ($IsLinux) {
+            $telemetry.OSCaption   = ((lsb_release -ds 2>$null) -join "").Trim('"')
+            $telemetry.OSBuild     = (uname -r) -join ""
+            $cpuModel              = ((grep -m 1 "model name" /proc/cpuinfo 2>$null) -replace ".*:\s*","").Trim()
+            $telemetry.CPUName     = if ($cpuModel) { $cpuModel } else { "Linux Virtual CPU" }
+            $telemetry.CPUCores    = [int]((nproc) -join "")
+            $memTotalKb            = [double](((grep MemTotal /proc/meminfo) -replace "[^0-9]",""))
+            $memAvailKb            = [double](((grep MemAvailable /proc/meminfo) -replace "[^0-9]",""))
+            $telemetry.RAMTotalGB  = [math]::Round($memTotalKb / 1048576, 2)
+            $telemetry.RAMFreeGB   = [math]::Round($memAvailKb / 1048576, 2)
+            $dfLine                = (df -BG / | Select-Object -Last 1) -split '\s+'
+            $telemetry.DiskTotalGB = [double]($dfLine[1] -replace "[^0-9.]","")
+            $telemetry.DiskFreeGB  = [double]($dfLine[3] -replace "[^0-9.]","")
+          } else {
+            $telemetry.OSCaption   = ((sw_vers -productName) + " " + (sw_vers -productVersion)).Trim()
+            $telemetry.OSBuild     = (sw_vers -buildVersion).Trim()
+            $cpuBrand              = (sysctl -n machdep.cpu.brand_string 2>$null)
+            $telemetry.CPUName     = if ($cpuBrand) { $cpuBrand.Trim() } else { "Apple Silicon / Virtual CPU" }
+            $telemetry.CPUCores    = [int](sysctl -n hw.ncpu)
+            $memBytes              = [double](sysctl -n hw.memsize)
+            $telemetry.RAMTotalGB  = [math]::Round($memBytes / 1GB, 2)
+            $pageSize              = [double](sysctl -n hw.pagesize)
+            $vmLines               = vm_stat
+            $freePages             = [double]((($vmLines | Select-String "Pages free:") -replace "[^0-9]",""))
+            $inactivePages         = [double]((($vmLines | Select-String "Pages inactive:") -replace "[^0-9]",""))
+            $telemetry.RAMFreeGB   = [math]::Round((($freePages + $inactivePages) * $pageSize) / 1GB, 2)
+            $dfLine                = (df -k / | Select-Object -Last 1) -split '\s+'
+            $telemetry.DiskTotalGB = [math]::Round(([double]$dfLine[1]) / 1048576, 2)
+            $telemetry.DiskFreeGB  = [math]::Round(([double]$dfLine[3]) / 1048576, 2)
+          }
+
+          $jsonPath = Join-Path ([System.IO.Path]::GetTempPath()) "dragon-telemetry.json"
+          $telemetry | ConvertTo-Json -Depth 4 | Set-Content -Path $jsonPath -Encoding UTF8
+          "DRAGON_TELEMETRY_FILE=$jsonPath" >> $env:GITHUB_ENV
+
+          Write-Host "========================================================" -ForegroundColor Yellow
+          Write-Host "           AHMAD DRAGON HARDWARE SPECIFICATIONS         " -ForegroundColor Yellow
+          Write-Host "========================================================" -ForegroundColor Yellow
+          Write-Host "OS Edition  : $($telemetry.OSCaption) (Build $($telemetry.OSBuild))"
+          Write-Host "Processor   : $($telemetry.CPUName) ($($telemetry.CPUCores) vCPUs)"
+          Write-Host "Memory      : $($telemetry.RAMFreeGB) GB Free / $($telemetry.RAMTotalGB) GB Total"
+          Write-Host "NVMe Disk   : $($telemetry.DiskFreeGB) GB Free / $($telemetry.DiskTotalGB) GB Total"
+          Write-Host "========================================================" -ForegroundColor Yellow
+
+      # =========================================================================
+      # 3A. CONFIGURE REMOTE DESKTOP & OPTIMIZATIONS (WINDOWS SERVER 2019/2022/2025)
+      # =========================================================================
+      - name: 3A. Configure Windows Remote Desktop & Tuning
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          INPUT_AUDIO_BOOST: ${{ inputs.enable_audio_boost }}
+        run: |
+          # Enable RDP & NLA Security Layer
+          $tsPath = 'HKLM:\System\CurrentControlSet\Control\Terminal Server'
+          $rdpTcpPath = 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp'
+
+          Set-ItemProperty -Path $tsPath -Name 'fDenyTSConnections' -Value 0
+          Set-ItemProperty -Path $rdpTcpPath -Name 'UserAuthentication' -Value 1
+          Set-ItemProperty -Path $rdpTcpPath -Name 'SecurityLayer' -Value 2
+          Set-ItemProperty -Path $rdpTcpPath -Name 'MaxMonitors' -Value 4
+          Set-ItemProperty -Path $rdpTcpPath -Name 'ColorDepth' -Value 4
+
+          # Create or Update RDP Administrator Account
+          $securePass = ConvertTo-SecureString $env:DRAGON_PASS -AsPlainText -Force
+          if (Get-LocalUser -Name $env:DRAGON_USER -ErrorAction SilentlyContinue) {
+            Set-LocalUser -Name $env:DRAGON_USER -Password $securePass -PasswordNeverExpires $true
+            Enable-LocalUser -Name $env:DRAGON_USER
+          } else {
+            New-LocalUser -Name $env:DRAGON_USER -Password $securePass -Description 'AHMAD DRAGON Remote Admin' -AccountNeverExpires -PasswordNeverExpires | Out-Null
+          }
+
+          foreach ($grp in @('Administrators', 'Remote Desktop Users')) {
+            $isMember = Get-LocalGroupMember -Group $grp -ErrorAction SilentlyContinue | Where-Object { $_.Name -match "\\$($env:DRAGON_USER)$" }
+            if (-not $isMember) {
+              Add-LocalGroupMember -Group $grp -Member $env:DRAGON_USER -ErrorAction SilentlyContinue
+            }
+          }
+
+          # Audio, Dark Theme & High-Performance Tuning
+          if ($env:INPUT_AUDIO_BOOST -eq "true") {
+            Write-Host "[+] Enabling Windows Audio Redirection & Dark Mode..." -ForegroundColor Cyan
+            Set-Service -Name 'Audiosrv' -StartupType Automatic -ErrorAction SilentlyContinue
+            Start-Service -Name 'Audiosrv' -ErrorAction SilentlyContinue
+            Set-ItemProperty -Path $rdpTcpPath -Name 'fDisableAudioCapture' -Value 0 -ErrorAction SilentlyContinue
+            $themePath = 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Themes\Personalize'
+            New-Item -Path $themePath -Force | Out-Null
+            Set-ItemProperty -Path $themePath -Name 'AppsUseLightTheme' -Value 0 -ErrorAction SilentlyContinue
+            Set-ItemProperty -Path $themePath -Name 'SystemUsesLightTheme' -Value 0 -ErrorAction SilentlyContinue
+            powercfg /setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c 2>$null
+          }
+
+          # Configure Tailscale-Scoped Firewall Rules for RDP (3389) & Web Control Panel (8080)
+          Get-NetFirewallRule -DisplayName 'AHMAD DRAGON*' -ErrorAction SilentlyContinue | Remove-NetFirewallRule
+          New-NetFirewallRule -DisplayName 'AHMAD DRAGON RDP' -Direction Inbound -Protocol TCP -LocalPort 3389 -RemoteAddress '100.64.0.0/10' -Action Allow -Profile Any | Out-Null
+          New-NetFirewallRule -DisplayName 'AHMAD DRAGON WEB PANEL' -Direction Inbound -Protocol TCP -LocalPort 8080 -RemoteAddress '100.64.0.0/10' -Action Allow -Profile Any | Out-Null
+
+          Set-Service TermService -StartupType Automatic
+          Restart-Service TermService -Force
+          Write-Host "[OK] Windows RDP configured and TermService restarted." -ForegroundColor Green
+
+      # =========================================================================
+      # 3B. CONFIGURE LINUX XRDP + XFCE4 DESKTOP (UBUNTU 22.04 / 24.04)
+      # =========================================================================
+      - name: 3B. Configure Linux XFCE4 Desktop & XRDP Server
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          INPUT_AUDIO_BOOST: ${{ inputs.enable_audio_boost }}
+        run: |
+          set -e
+          sudo DEBIAN_FRONTEND=noninteractive apt-get update -y
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y xfce4 xfce4-goodies xrdp dbus-x11 x11-xserver-utils
+
+          if ! id "$DRAGON_USER" &>/dev/null; then
+            sudo useradd -m -s /bin/bash "$DRAGON_USER"
+          fi
+          echo "$DRAGON_USER:$DRAGON_PASS" | sudo chpasswd
+          sudo usermod -aG sudo,ssl-cert "$DRAGON_USER"
+
+          # Allow passwordless sudo for the RDP admin user
+          echo "$DRAGON_USER ALL=(ALL) NOPASSWD:ALL" | sudo tee "/etc/sudoers.d/dragon-$DRAGON_USER" >/dev/null
+          sudo chmod 440 "/etc/sudoers.d/dragon-$DRAGON_USER"
+
+          # Configure XFCE session
+          echo "xfce4-session" | sudo tee "/home/$DRAGON_USER/.xsession" >/dev/null
+          sudo chown "$DRAGON_USER:$DRAGON_USER" "/home/$DRAGON_USER/.xsession"
+
+          # Prevent Polkit colord authentication popup in XRDP
+          sudo mkdir -p /etc/polkit-1/localauthority/50-local.d
+          sudo tee /etc/polkit-1/localauthority/50-local.d/45-allow-colord.pkla >/dev/null <<'EOF'
+          [Allow Colord all Users]
+          Identity=unix-user:*
+          Action=org.freedesktop.color-manager.create-device;org.freedesktop.color-manager.create-profile;org.freedesktop.color-manager.delete-device;org.freedesktop.color-manager.delete-profile;org.freedesktop.color-manager.modify-device;org.freedesktop.color-manager.modify-profile
+          ResultAny=no
+          ResultInactive=no
+          ResultActive=yes
+          EOF
+
+          # Apply dark theme preference if audio/boost is enabled
+          if [ "$INPUT_AUDIO_BOOST" = "true" ]; then
+            sudo -u "$DRAGON_USER" mkdir -p "/home/$DRAGON_USER/.config/xfce4/xfconf/xfce-perchannel-xml"
+            sudo tee "/home/$DRAGON_USER/.config/xfce4/xfconf/xfce-perchannel-xml/xsettings.xml" >/dev/null <<'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <channel name="xsettings" version="1.0">
+            <property name="Net" type="empty">
+              <property name="ThemeName" type="string" value="Adwaita-dark"/>
+            </property>
+          </channel>
+          EOF
+            sudo chown -R "$DRAGON_USER:$DRAGON_USER" "/home/$DRAGON_USER/.config"
+          fi
+
+          sudo sed -i 's/^port=.*/port=3389/' /etc/xrdp/xrdp.ini
+          sudo systemctl enable xrdp
+          sudo systemctl restart xrdp
+          echo "[OK] Linux XFCE4 + XRDP configured successfully."
+
+      # =========================================================================
+      # 3C. CONFIGURE MACOS SCREEN SHARING / VNC (MACOS 15)
+      # =========================================================================
+      - name: 3C. Configure macOS Screen Sharing (VNC)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -e
+          # Create or update macOS Admin user for Screen Sharing
+          if ! id "$DRAGON_USER" &>/dev/null; then
+            sudo sysadminctl -addUser "$DRAGON_USER" -fullName "AHMAD DRAGON Admin" -password "$DRAGON_PASS" -admin
+          else
+            sudo dscl . -passwd "/Users/$DRAGON_USER" "$DRAGON_PASS"
+          fi
+
+          # Enable Apple Remote Desktop & VNC Screen Sharing on Port 5900
+          sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart \
+            -activate -configure -access -on \
+            -users "$DRAGON_USER" -privs -all \
+            -clientopts -setvnclegacy -vnclegacy yes \
+            -setvncpw -vncpw "$DRAGON_PASS" \
+            -restart -agent -menu || true
+
+          sudo launchctl enable system/com.apple.screensharing || true
+          sudo launchctl kickstart -k system/com.apple.screensharing || true
+          echo "[OK] macOS Screen Sharing (VNC Port 5900) enabled."
+
+      # =========================================================================
+      # 4. INSTALL & CONNECT TAILSCALE MESH NETWORK
+      # =========================================================================
+      - name: 4. Connect Tailscale Secure Mesh VPN
+        shell: pwsh
+        env:
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+        run: |
+          $nodeHostname = "ahmad-dragon-$($env:RUNNER_OS.ToLower())-$env:GITHUB_RUN_ID"
+
+          if ($IsWindows) {
+            $installer = Join-Path $env:TEMP "tailscale.msi"
+            Invoke-WebRequest 'https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi' -OutFile $installer
+            $proc = Start-Process msiexec.exe -ArgumentList "/i `"$installer`" /qn /norestart" -Wait -PassThru
+            Remove-Item $installer -Force -ErrorAction SilentlyContinue
+            if ($proc.ExitCode -notin @(0, 3010)) { throw "Tailscale MSI installation failed with exit code $($proc.ExitCode)" }
+            $ts = Join-Path $env:ProgramFiles "Tailscale\tailscale.exe"
+            & $ts up "--authkey=$env:TAILSCALE_AUTHKEY" "--hostname=$nodeHostname" --accept-routes
+          } elseif ($IsLinux) {
+            curl -fsSL https://tailscale.com/install.sh | sh
+            $ts = "tailscale"
+            sudo $ts up "--authkey=$env:TAILSCALE_AUTHKEY" "--hostname=$nodeHostname" --accept-routes
+          } else {
+            brew install tailscale
+            sudo tailscaled --state=/var/db/tailscale/tailscaled.state --socket=/var/run/tailscaled.socket >/tmp/tailscaled.log 2>&1 &
+            Start-Sleep -Seconds 3
+            $ts = "tailscale"
+            sudo $ts --socket=/var/run/tailscaled.socket up "--authkey=$env:TAILSCALE_AUTHKEY" "--hostname=$nodeHostname" --accept-routes
+          }
+
+          $ip = $null
+          for ($i = 0; $i -lt 30; $i++) {
+            Start-Sleep -Seconds 2
+            $res = if ($IsMacOS) {
+              sudo tailscale --socket=/var/run/tailscaled.socket ip -4 2>$null
+            } else {
+              & $ts ip -4 2>$null
+            }
+            if ($res -match '^100\.') {
+              $ip = ($res | Select-Object -First 1).Trim()
+              break
+            }
+          }
+
+          if (-not $ip) { throw "Failed to acquire Tailscale 100.x.y.z IPv4 address" }
+          "TAILSCALE_IP=$ip" >> $env:GITHUB_ENV
+          "TAILSCALE_HOSTNAME=$nodeHostname" >> $env:GITHUB_ENV
+          Write-Host "[OK] Tailscale Connected! Mesh IP: $ip ($nodeHostname)" -ForegroundColor Green
+
+      # =========================================================================
+      # 5. INSTALL ESSENTIAL TOOLS & DESKTOP CONNECTION SHORTCUTS
+      # =========================================================================
+      - name: 5. Install Essential Tools & Desktop Info
+        if: inputs.install_tools == true
+        shell: pwsh
+        run: |
+          $infoText = @"
+          AHMAD DRAGON - Connection Info
+          ==============================
+          OS          : $env:DRAGON_OS_LABEL
+          Protocol    : $env:DRAGON_PROTO
+          Tailscale   : $($env:TAILSCALE_IP):$($env:DRAGON_RDP_PORT)
+          Web Panel   : http://$($env:TAILSCALE_IP):$($env:DRAGON_WEB_PORT)
+          Username    : $env:DRAGON_USER
+          "@
+
+          if ($IsWindows) {
+            Write-Host "[+] Installing essential Windows tools via Chocolatey..." -ForegroundColor Cyan
+            choco install -y 7zip notepadplusplus --no-progress --limit-output 2>$null
+            $desktop = "C:\Users\$($env:DRAGON_USER)\Desktop"
+            New-Item -ItemType Directory -Path $desktop -Force | Out-Null
+            Set-Content -Path (Join-Path $desktop "AHMAD-DRAGON-INFO.txt") -Value $infoText -Encoding UTF8
+          } elseif ($IsLinux) {
+            Write-Host "[+] Installing essential Linux tools..." -ForegroundColor Cyan
+            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y htop curl wget git unzip nano net-tools
+            $desktop = "/home/$($env:DRAGON_USER)/Desktop"
+            sudo mkdir -p $desktop
+            $infoText | sudo tee "$desktop/AHMAD-DRAGON-INFO.txt" >/dev/null
+            sudo chown -R "$($env:DRAGON_USER):$($env:DRAGON_USER)" $desktop
+          } else {
+            Write-Host "[+] Installing essential macOS tools..." -ForegroundColor Cyan
+            brew install htop wget 2>$null || true
+            $desktop = "/Users/$($env:DRAGON_USER)/Desktop"
+            sudo mkdir -p $desktop
+            $infoText | sudo tee "$desktop/AHMAD-DRAGON-INFO.txt" >/dev/null
+            sudo chown "$($env:DRAGON_USER)" "$desktop/AHMAD-DRAGON-INFO.txt" 2>$null || true
+          }
+          Write-Host "[OK] Essential tools & Desktop info ready." -ForegroundColor Green
+
+      # =========================================================================
+      # 6. LAUNCH CROSS-PLATFORM WEB CONTROL PANEL (HTTP PORT 8080 ON TAILSCALE)
+      # =========================================================================
+      - name: 6. Start Cross-Platform AHMAD DRAGON Web Control Panel
+        if: inputs.enable_web_panel == true
+        shell: pwsh
+        env:
+          INPUT_MAX_MINUTES: ${{ inputs.session_minutes || '350' }}
+        run: |
+          $pyScript = @'
+          import os, sys, json, time, socket, shutil, subprocess, platform
+          from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+          from urllib.parse import urlparse, parse_qs
+
+          PORT = int(os.environ.get("DRAGON_WEB_PORT", "8080"))
+          IP = os.environ.get("TAILSCALE_IP", "127.0.0.1")
+          RDP_PORT = os.environ.get("DRAGON_RDP_PORT", "3389")
+          PROTO = os.environ.get("DRAGON_PROTO", "RDP")
+          USER = os.environ.get("DRAGON_USER", "RDP")
+          OS_LABEL = os.environ.get("DRAGON_OS_LABEL", platform.platform())
+          MAX_MIN = float(os.environ.get("INPUT_MAX_MINUTES", "350"))
+
+          TMP_DIR = os.environ.get("RUNNER_TEMP", "/tmp" if os.name != "nt" else os.environ.get("TEMP", "."))
+          STOP_FLAG = os.path.join(TMP_DIR, "dragon-stop.signal")
+          PASS_FILE = os.path.join(TMP_DIR, "dragon-current-pass.txt")
+
+          with open(PASS_FILE, "w", encoding="utf-8") as f:
+              f.write(os.environ.get("DRAGON_PASS", ""))
+
+          START_TS = time.time()
+
+          def read_pass():
+              try:
+                  with open(PASS_FILE, "r", encoding="utf-8") as f:
+                      return f.read().strip()
+              except Exception:
+                  return ""
+
+          def get_metrics():
+              sys_name = platform.system()
+              cpu_pct, ram_pct, disk_free = 0, 0, 0
+              try:
+                  total, used, free = shutil.disk_usage("/" if sys_name != "Windows" else "C:\\")
+                  disk_free = round(free / (1024 ** 3), 1)
+              except Exception:
+                  pass
+
+              if sys_name == "Windows":
+                  try:
+                      out = subprocess.check_output(
+                          ["pwsh", "-NoProfile", "-Command",
+                           "$os=Get-CimInstance Win32_OperatingSystem; $c=(Get-CimInstance Win32_Processor|Measure-Object LoadPercentage -Average).Average; $r=[math]::Round((($os.TotalVisibleMemorySize-$os.FreePhysicalMemory)/$os.TotalVisibleMemorySize)*100,1); Write-Output \"$c|$r\""],
+                          text=True, timeout=5
+                      ).strip().split("|")
+                      cpu_pct = int(float(out[0] or 0))
+                      ram_pct = float(out[1] or 0)
+                  except Exception:
+                      pass
+              elif sys_name == "Linux":
+                  try:
+                      load1 = os.getloadavg()[0]
+                      cores = os.cpu_count() or 1
+                      cpu_pct = min(100, int((load1 / cores) * 100))
+                      with open("/proc/meminfo") as mf:
+                          mem = {}
+                          for line in mf:
+                              k, v = line.split(":", 1)
+                              mem[k.strip()] = int(v.strip().split()[0])
+                          ram_pct = round(((mem["MemTotal"] - mem["MemAvailable"]) / mem["MemTotal"]) * 100, 1)
+                  except Exception:
+                      pass
+              else:
+                  try:
+                      load1 = os.getloadavg()[0]
+                      cores = os.cpu_count() or 1
+                      cpu_pct = min(100, int((load1 / cores) * 100))
+                  except Exception:
+                      pass
+              return cpu_pct, ram_pct, disk_free
+
+          def run_action(cmd):
+              sys_name = platform.system()
+              if cmd == "restart-rdp":
+                  if sys_name == "Windows":
+                      subprocess.run(["pwsh", "-NoProfile", "-Command", "Restart-Service TermService -Force"], check=False)
+                      return "TermService (RDP) restarted successfully"
+                  elif sys_name == "Linux":
+                      subprocess.run(["sudo", "systemctl", "restart", "xrdp"], check=False)
+                      return "XRDP service restarted successfully"
+                  else:
+                      subprocess.run(["sudo", "launchctl", "kickstart", "-k", "system/com.apple.screensharing"], check=False)
+                      return "macOS Screen Sharing restarted successfully"
+              elif cmd == "rotate-pass":
+                  import secrets, string
+                  alphabet = string.ascii_letters + string.digits
+                  new_p = "Drg#" + "".join(secrets.choice(alphabet) for _ in range(10)) + "!9A"
+                  if sys_name == "Windows":
+                      subprocess.run(["pwsh", "-NoProfile", "-Command",
+                                      f"$s=ConvertTo-SecureString '{new_p}' -AsPlainText -Force; Set-LocalUser -Name '{USER}' -Password $s"], check=False)
+                  elif sys_name == "Linux":
+                      subprocess.run(["sudo", "chpasswd"], input=f"{USER}:{new_p}\n", text=True, check=False)
+                  else:
+                      subprocess.run(["sudo", "dscl", ".", "-passwd", f"/Users/{USER}", new_p], check=False)
+                  with open(PASS_FILE, "w", encoding="utf-8") as f:
+                      f.write(new_p)
+                  return "Password rotated successfully!"
+              elif cmd == "flush-ram":
+                  if sys_name == "Windows":
+                      subprocess.run(["ipconfig", "/flushdns"], check=False)
+                  elif sys_name == "Linux":
+                      subprocess.run(["sudo", "sh", "-c", "sync; echo 1 > /proc/sys/vm/drop_caches"], check=False)
+                  return "Cache & DNS flushed successfully"
+              elif cmd == "stop-server":
+                  with open(STOP_FLAG, "w", encoding="utf-8") as f:
+                      f.write("STOP")
+                  return "Shutdown signal sent! Runner will terminate within 60 seconds."
+              return "Unknown command"
+
+          HTML_TEMPLATE = """<!DOCTYPE html>
+          <html lang="ar" dir="rtl">
+          <head>
+            <meta charset="utf-8" />
+            <meta name="viewport" content="width=device-width, initial-scale=1" />
+            <title>AHMAD DRAGON // Live Control Panel</title>
+            <style>
+              body { background:#08090C; color:#F3F4F6; font-family:system-ui,-apple-system,sans-serif; margin:0; padding:24px; }
+              .wrap { max-width:980px; margin:0 auto; }
+              .hdr { border:1px solid #262936; background:#101218; padding:20px; border-radius:10px; display:flex; flex-wrap:wrap; gap:12px; justify-content:space-between; align-items:center; margin-bottom:20px; border-right:4px solid #F43F5E; }
+              .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(210px,1fr)); gap:14px; margin-bottom:20px; }
+              .card { background:#101218; border:1px solid #262936; padding:16px; border-radius:10px; }
+              .lbl { color:#9CA3AF; font-size:12px; margin-bottom:6px; display:flex; justify-content:space-between; }
+              .val { font-family:ui-monospace,monospace; font-size:18px; font-weight:700; color:#10B981; direction:ltr; text-align:left; word-break:break-all; }
+              .btns { display:flex; flex-wrap:wrap; gap:10px; margin-top:16px; }
+              button, a.btn { background:#F43F5E; color:#fff; border:none; padding:10px 16px; border-radius:6px; cursor:pointer; font-weight:700; text-decoration:none; font-size:13px; transition:opacity .15s; }
+              button:hover, a.btn:hover { opacity:0.9; }
+              button.sec { background:#181B24; border:1px solid #262936; color:#F3F4F6; }
+              button.copy { background:transparent; border:1px solid #262936; color:#9CA3AF; padding:2px 8px; font-size:11px; border-radius:4px; }
+            </style>
+          </head>
+          <body>
+            <div class="wrap">
+              <div class="hdr">
+                <div>
+                  <h2 style="margin:0;color:#F43F5E">AHMAD DRAGON // لوحة تحكم السيرفر المباشرة</h2>
+                  <p style="margin:4px 0 0;color:#9CA3AF;font-size:13px">النظام: __OS__ | البروتوكول: __PROTO__ | متصل عبر Tailscale</p>
+                </div>
+                <a class="btn" href="/download.rdp">تحميل ملف الاتصال (.RDP)</a>
+              </div>
+              <div class="grid">
+                <div class="card"><div class="lbl"><span>عنوان IP</span><button class="copy" onclick="cp('ip')">نسخ</button></div><div class="val" id="ip">__IP__:__PORT__</div></div>
+                <div class="card"><div class="lbl"><span>اسم المستخدم</span><button class="copy" onclick="cp('usr')">نسخ</button></div><div class="val" id="usr">__USER__</div></div>
+                <div class="card"><div class="lbl"><span>كلمة المرور</span><button class="copy" onclick="cp('pwd')">نسخ</button></div><div class="val" id="pwd">__PASS__</div></div>
+                <div class="card"><div class="lbl"><span>الوقت المتبقي</span></div><div class="val" id="rem">-- دقيقة</div></div>
+                <div class="card"><div class="lbl"><span>استهلاك المعالج (CPU)</span></div><div class="val" id="cpu">--%</div></div>
+                <div class="card"><div class="lbl"><span>استهلاك الرام (RAM)</span></div><div class="val" id="ram">--%</div></div>
+                <div class="card"><div class="lbl"><span>المساحة الحرة</span></div><div class="val" id="disk">-- GB</div></div>
+              </div>
+              <div class="card">
+                <div class="lbl">أوامر التحكم السريع بالسيرفر عن بُعد</div>
+                <div class="btns">
+                  <button onclick="act('restart-rdp')">إعادة تشغيل الاتصال البعيد</button>
+                  <button class="sec" onclick="act('rotate-pass')">توليد كلمة مرور جديدة فوراً</button>
+                  <button class="sec" onclick="act('flush-ram')">تنظيف الذاكرة و DNS</button>
+                  <button class="sec" style="border-color:#EF4444;color:#EF4444" onclick="if(confirm('هل أنت متأكد من إيقاف السيرفر؟')) act('stop-server')">إيقاف السيرفر وإنهاء الجلسة</button>
+                </div>
+                <p id="msg" style="font-family:monospace;color:#F59E0B;margin-top:12px;font-size:13px"></p>
+              </div>
+            </div>
+            <script>
+              function cp(id){ navigator.clipboard.writeText(document.getElementById(id).innerText); document.getElementById('msg').innerText='تم النسخ!'; }
+              async function act(c){
+                const r = await fetch('/api/action?cmd='+c);
+                const d = await r.json();
+                document.getElementById('msg').innerText = d.message;
+                if(d.password) document.getElementById('pwd').innerText = d.password;
+              }
+              async function refresh(){
+                try{
+                  const r = await fetch('/api/status');
+                  const d = await r.json();
+                  document.getElementById('pwd').innerText = d.password;
+                  document.getElementById('rem').innerText = d.remainingMinutes + ' دقيقة';
+                  document.getElementById('cpu').innerText = d.cpuPercent + '%';
+                  document.getElementById('ram').innerText = d.ramPercent + '%';
+                  document.getElementById('disk').innerText = d.diskFreeGb + ' GB';
+                }catch(e){}
+              }
+              refresh();
+              setInterval(refresh, 5000);
+            </script>
+          </body>
+          </html>"""
+
+          class Handler(BaseHTTPRequestHandler):
+              def log_message(self, format, *args):
+                  return
+              def do_GET(self):
+                  parsed = urlparse(self.path)
+                  if parsed.path == "/download.rdp":
+                      rdp = "\r\n".join([
+                          f"full address:s:{IP}:{RDP_PORT}",
+                          f"username:s:{USER}",
+                          "prompt for credentials:i:1",
+                          "screen mode id:i:2",
+                          "session bpp:i:32",
+                          "audiomode:i:0",
+                          "redirectclipboard:i:1",
+                          "authentication level:i:2",
+                          "enablecredsspsupport:i:1",
+                      ]).encode("utf-8")
+                      self.send_response(200)
+                      self.send_header("Content-Type", "application/x-rdp")
+                      self.send_header("Content-Disposition", f"attachment; filename=AHMAD-DRAGON-{IP}.rdp")
+                      self.end_headers()
+                      self.wfile.write(rdp)
+                  elif parsed.path == "/api/status":
+                      elapsed = round((time.time() - START_TS) / 60.0, 1)
+                      remain = max(0.0, round(MAX_MIN - elapsed, 1))
+                      cpu, ram, disk = get_metrics()
+                      payload = json.dumps({
+                          "ip": IP, "rdpPort": RDP_PORT, "protocol": PROTO,
+                          "username": USER, "password": read_pass(), "os": OS_LABEL,
+                          "cpuPercent": cpu, "ramPercent": ram, "diskFreeGb": disk,
+                          "elapsedMinutes": elapsed, "remainingMinutes": remain
+                      }).encode("utf-8")
+                      self.send_response(200)
+                      self.send_header("Content-Type", "application/json; charset=utf-8")
+                      self.end_headers()
+                      self.wfile.write(payload)
+                  elif parsed.path == "/api/action":
+                      qs = parse_qs(parsed.query)
+                      cmd = qs.get("cmd", [""])[0]
+                      msg = run_action(cmd)
+                      payload = json.dumps({"ok": True, "message": msg, "password": read_pass()}).encode("utf-8")
+                      self.send_response(200)
+                      self.send_header("Content-Type", "application/json; charset=utf-8")
+                      self.end_headers()
+                      self.wfile.write(payload)
+                  else:
+                      html = (HTML_TEMPLATE
+                              .replace("__OS__", OS_LABEL)
+                              .replace("__PROTO__", PROTO)
+                              .replace("__IP__", IP)
+                              .replace("__PORT__", RDP_PORT)
+                              .replace("__USER__", USER)
+                              .replace("__PASS__", read_pass()))
+                      self.send_response(200)
+                      self.send_header("Content-Type", "text/html; charset=utf-8")
+                      self.end_headers()
+                      self.wfile.write(html.encode("utf-8"))
+
+          if __name__ == "__main__":
+              # Bind strictly to Tailscale mesh IP so panel is never exposed to public internet
+              server = ThreadingHTTPServer((IP, PORT), Handler)
+              server.serve_forever()
+          '@
+
+          $scriptPath = Join-Path ([System.IO.Path]::GetTempPath()) "dragon-web-panel.py"
+          Set-Content -Path $scriptPath -Value $pyScript -Encoding UTF8
+
+          if ($IsWindows) {
+            Start-Process python -ArgumentList "`"$scriptPath`"" -WindowStyle Hidden
+          } else {
+            $logOut = "/tmp/dragon-web-panel.log"
+            nohup python3 "$scriptPath" > "$logOut" 2>&1 &
+          }
+          Start-Sleep -Seconds 2
+          Write-Host "[OK] AHMAD DRAGON Web Control Panel running at: http://$($env:TAILSCALE_IP):$($env:DRAGON_WEB_PORT)" -ForegroundColor Green
+
+      # =========================================================================
+      # 7. VERIFY REMOTE LISTENER & PUBLISH GITHUB STEP SUMMARY DASHBOARD
+      # =========================================================================
+      - name: 7. Verify Remote Port & Generate Connection Dashboard
+        shell: pwsh
+        run: |
+          $port = [int]$env:DRAGON_RDP_PORT
+          $ready = $false
+          for ($i = 0; $i -lt 30; $i++) {
+            if ($IsWindows) {
+              $listener = Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue
+              if ($listener) { $ready = $true; break }
+            } elseif ($IsLinux) {
+              $ss = ss -tlnp 2>$null | Select-String ":$port\b"
+              if ($ss) { $ready = $true; break }
+            } else {
+              $lsof = lsof -iTCP:$port -sTCP:LISTEN 2>$null
+              if ($lsof) { $ready = $true; break }
+            }
+            Start-Sleep -Seconds 2
+          }
+          if (-not $ready) { throw "$($env:DRAGON_PROTO) Port $port is not listening!" }
+
+          $telemetry = Get-Content $env:DRAGON_TELEMETRY_FILE -Raw | ConvertFrom-Json
+
+          Write-Host ""
+          Write-Host "╔══════════════════════════════════════════════════════════════════╗" -ForegroundColor Red
+          Write-Host "║               AHMAD DRAGON SERVER IS NOW ONLINE!                 ║" -ForegroundColor Red
+          Write-Host "╠══════════════════════════════════════════════════════════════════╣" -ForegroundColor Red
+          Write-Host "║ OS Edition     : $($telemetry.OSCaption)"
+          Write-Host "║ Protocol       : $($env:DRAGON_PROTO)"
+          Write-Host "║ Tailscale IP   : $($env:TAILSCALE_IP):$($env:DRAGON_RDP_PORT)"
+          Write-Host "║ Web Dashboard  : http://$($env:TAILSCALE_IP):$($env:DRAGON_WEB_PORT)"
+          Write-Host "║ Username       : $($env:DRAGON_USER)"
+          Write-Host "║ Password       : $($env:DRAGON_PASS) ($($env:DRAGON_PASS_SOURCE))"
+          Write-Host "║ CPU & RAM      : $($telemetry.CPUName) | $($telemetry.RAMTotalGB) GB RAM"
+          Write-Host "╚══════════════════════════════════════════════════════════════════╝" -ForegroundColor Red
+
+          $summary = @"
+          ## 🐉 AHMAD DRAGON // Server Active & Ready
+          | Parameter | Connection Value |
+          | :--- | :--- |
+          | **Operating System** | `$($telemetry.OSCaption) (Build $($telemetry.OSBuild))` |
+          | **Remote Protocol** | `$($env:DRAGON_PROTO)` |
+          | **Address (Tailscale)** | `$($env:TAILSCALE_IP):$($env:DRAGON_RDP_PORT)` |
+          | **Live Web Control Panel** | **http://$($env:TAILSCALE_IP):$($env:DRAGON_WEB_PORT)** |
+          | **Administrator Username** | `$($env:DRAGON_USER)` |
+          | **Password (`$($env:DRAGON_PASS_SOURCE)`)** | `$($env:DRAGON_PASS)` |
+          | **Processor & Cores** | `$($telemetry.CPUName) ($($telemetry.CPUCores) vCPUs)` |
+          | **Memory & NVMe Storage** | `$($telemetry.RAMTotalGB) GB RAM \| $($telemetry.DiskFreeGB) GB Free SSD` |
+          "@
+          $summary | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding UTF8 -Append
+
+      # =========================================================================
+      # 8. SMART KEEP-ALIVE HEARTBEAT WITH WEB STOP SIGNAL
+      # =========================================================================
+      - name: 8. Keep Server Alive & Stream Telemetry
+        shell: pwsh
+        env:
+          INPUT_MAX_MINUTES: ${{ inputs.session_minutes || '350' }}
+        run: |
+          $maxMinutes = [int]$env:INPUT_MAX_MINUTES
+          $stopSignal = Join-Path ([System.IO.Path]::GetTempPath()) "dragon-stop.signal"
+          $start = Get-Date
+
+          Write-Host "[+] Server Keep-Alive Loop Active for $maxMinutes minutes..." -ForegroundColor Cyan
+          Write-Host "[+] Open http://$($env:TAILSCALE_IP):$($env:DRAGON_WEB_PORT) in your browser to control the server." -ForegroundColor Green
+
+          while (((Get-Date) - $start).TotalMinutes -lt $maxMinutes) {
+            if (Test-Path $stopSignal) {
+              Write-Host "[!] Shutdown signal received from AHMAD DRAGON Web Control Panel. Stopping gracefully..." -ForegroundColor Yellow
+              break
+            }
+
+            $elapsed = [math]::Round(((Get-Date) - $start).TotalMinutes, 1)
+            $remaining = [math]::Round($maxMinutes - $elapsed, 1)
+
+            Write-Host "[DRAGON HEARTBEAT $(Get-Date -Format 'HH:mm:ss')] $($env:DRAGON_PROTO): $($env:TAILSCALE_IP):$($env:DRAGON_RDP_PORT) | WebUI: http://$($env:TAILSCALE_IP):$($env:DRAGON_WEB_PORT) | User: $($env:DRAGON_USER) | Remaining: $remaining min"
+            Start-Sleep -Seconds 60
+          }
+
+      # =========================================================================
+      # 9. GRACEFUL TAILSCALE LOGOUT & CLEANUP
+      # =========================================================================
+      - name: 9. Cleanup & Disconnect Tailscale Node
+        if: always()
+        shell: pwsh
+        run: |
+          Write-Host "[+] Disconnecting Tailscale node cleanly..." -ForegroundColor Cyan
+          if ($IsWindows) {
+            $ts = Join-Path $env:ProgramFiles "Tailscale\tailscale.exe"
+            if (Test-Path $ts) { & $ts logout 2>$null }
+          } elseif ($IsMacOS) {
+            sudo tailscale --socket=/var/run/tailscaled.socket logout 2>$null
+          } else {
+            sudo tailscale logout 2>$null
+          }
+          Write-Host "[OK] Session terminated cleanly." -ForegroundColor Green
